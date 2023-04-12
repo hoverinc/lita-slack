@@ -1,3 +1,4 @@
+require 'thread'
 require 'faraday'
 
 require 'lita/adapters/slack/team_data'
@@ -11,6 +12,10 @@ module Lita
     class Slack < Adapter
       # @api private
       class API
+        DEFAULT_PAGE_SIZE = 1000
+        DEFAULT_RATE_LIMITED_WAIT_TIME = 65
+        DEFAULT_MAX_RATE_LIMITED_WAIT_TIME = 600
+
         def initialize(config, stubs = nil)
           @config = config
           @stubs = stubs
@@ -22,7 +27,7 @@ module Lita
         end
 
         def im_open(user_id)
-          response_data = call_api("im.open", user: user_id)
+          response_data = call_api('conversations.open', users: user_id)
 
           SlackIM.new(response_data["channel"]["id"], user_id)
         end
@@ -57,34 +62,35 @@ module Lita
           params.merge!({
             types: types.join(',')
           })
+          params[:limit] = DEFAULT_PAGE_SIZE unless params[:limit]
           call_paginated_api(method: 'conversations.list', params: params, result_field: 'channels')
         end
 
         def call_paginated_api(method:, params:, result_field:)
+          Lita.logger.debug("Start #{method} paginated API call with parameters #{params}. Callers: #{caller.join(', ')}")
+
+          page = 1
           result = call_api(
             method,
-            params
+            params,
+            page
           )
 
           next_cursor = fetch_cursor(result)
           old_cursor = nil
-
+          page += 1
           while !next_cursor.nil? && !next_cursor.empty? && next_cursor != old_cursor
             old_cursor = next_cursor
             params[:cursor] = next_cursor
-
             next_page = call_api(
               method,
-              params
+              params,
+              page
             )
-
-            if next_page['error'] == 'ratelimited' && next_page['retry_after'] < 5
-              sleep(next_page['retry_after'])
-              old_cursor = nil
-            else
-              next_cursor = fetch_cursor(next_page)
-              result[result_field] += next_page[result_field]
-            end
+            next_cursor = fetch_cursor(next_page)
+            result[result_field] += next_page[result_field]
+            Lita.logger.debug("#{method} API call page #{page} obtained successfully (#{next_page[result_field].size} items returned)")
+            page += 1
           end
           result
         end
@@ -144,19 +150,46 @@ module Lita
         end
 
         def rtm_start
-          Lita.logger.debug("Starting `rtm_start` method")
-          response_data = call_api("rtm.start")
+          Lita.logger.debug("Starting `rtm_connect` method")
+          connect_response_data = call_api("rtm.connect")
           Lita.logger.debug("Started building TeamData")
+
+          users_list_response_data = nil
+          conversations_response_data = nil
+
+          threads = []
+          threads << Thread.new {
+            users_list_response_data = users_list
+          }
+          threads << Thread.new {
+            conversations_response_data = conversations_list(params: {exclude_archived: true})
+          }
+          threads.each(&:join)
+
+          channels = conversations_response_data['channels'].select do |conversation|
+            conversation['is_channel']
+          end
+          groups = conversations_response_data['channels'].select do |conversation|
+            conversation['is_group']
+          end
+          ims = conversations_response_data['channels'].select do |conversation|
+            conversation['is_im']
+          end
+
+          Lita.logger.debug("Obtained #{users_list_response_data["members"].size} users")
+          Lita.logger.debug("Obtained #{channels.size} channels")
+          Lita.logger.debug("Obtained #{groups.size} groups")
+          Lita.logger.debug("Obtained #{ims.size} ims")
+
           team_data = TeamData.new(
-            SlackIM.from_data_array(response_data["ims"]),
-            SlackUser.from_data(response_data["self"]),
-            SlackUser.from_data_array(response_data["users"]),
-            SlackChannel.from_data_array(response_data["channels"]) +
-              SlackChannel.from_data_array(response_data["groups"]),
-            response_data["url"],
+            SlackIM.from_data_array(ims),
+            SlackUser.from_data(connect_response_data["self"]),
+            SlackUser.from_data_array(users_list_response_data["members"]),
+            SlackChannel.from_data_array(channels) + SlackChannel.from_data_array(groups),
+            connect_response_data["url"],
           )
           Lita.logger.debug("Finished building TeamData")
-          Lita.logger.debug("Finishing method `rtm_start`")
+          Lita.logger.debug("Finishing method `rtm_connect`")
           team_data
         end
 
@@ -166,17 +199,68 @@ module Lita
         attr_reader :config
         attr_reader :post_message_config
 
-        def call_api(method, post_data = {})
-          Lita.logger.debug("Starting request to Slack API with rtm.start")
+        def wait_for_rate_limit(response, method, retry_count, page = nil)
+          default_rate_limited_wait_time = ENV.fetch("DEFAULT_RATE_LIMITED_WAIT_TIME", DEFAULT_RATE_LIMITED_WAIT_TIME).to_i
+          default_max_rate_limited_wait_time = ENV.fetch("DEFAULT_MAX_RATE_LIMITED_WAIT_TIME", DEFAULT_MAX_RATE_LIMITED_WAIT_TIME).to_i
+
+          request_type = 'non-paginated'
+          request_type = "page #{page}" if page
+          base_sleep_amount = response.headers.fetch('retry-after', default_rate_limited_wait_time).to_i
+          sleep_amount = base_sleep_amount * retry_count
+          topped_sleep_amount = [default_max_rate_limited_wait_time, sleep_amount].min
+          rate_limiting_warning_message = "Rate-limited in #{request_type} #{method} request, retry #{retry_count}, will wait #{topped_sleep_amount} seconds"
+          Lita.logger.info(rate_limiting_warning_message)
+
+          sleep(topped_sleep_amount)
+          sleep_amount
+        end
+
+        def call_api(method, post_data = {}, page = nil)
+          request_type = 'non-paginated'
+          request_type = "page #{page}" if page
+
+          Lita.logger.debug("Starting #{request_type} #{method} request. Callers: #{caller.join(', ')}")
+
+          url = "https://slack.com/api/#{method}"
+
           response = connection.post(
-            "https://slack.com/api/#{method}",
+            url,
             { token: config.token }.merge(post_data)
           )
-          Lita.logger.debug("Finished request to Slack API rtm.start")
-          data = parse_response(response, method)
-          Lita.logger.debug("Finished parsing rtm.start response")
-          raise "Slack API call to #{method} returned an error: #{data["error"]}." if data["error"]
+          retry_count = 1
 
+          Lita.logger.debug("Finished #{request_type} request retry #{retry_count} to Slack API #{method} with HTTP status #{response.status}")
+
+          while response.status == 429
+            waited_time = wait_for_rate_limit(response, method, retry_count, page)
+            Lita.logger.info("#{method} #{request_type} request retry #{retry_count} rate-limited, waited #{waited_time} seconds")
+            Lita.logger.debug("Waited request Response body #{response.body}")
+
+            response = connection.post(
+              url,
+              { token: config.token }.merge(post_data)
+            )
+            retry_count += 1
+            Lita.logger.debug("Finished #{method} #{request_type} request retry #{retry_count} with HTTP status #{response.status}")
+          end
+
+          Lita.logger.debug("Obtained from #{method} #{request_type} request retry #{retry_count} a HTTP status #{response.status}")
+
+          data = parse_response(response, method)
+          Lita.logger.debug("Finished #{method} #{request_type} request retry #{retry_count} response")
+
+          if data["error"]
+            error_message = "Slack API #{request_type} #{method} request retry #{retry_count} returned an error: #{data["error"]}."
+            log_to_sentry(error_message, url, post_data)
+            Lita.logger.error(error_message)
+            raise error_message
+          else
+            Lita.logger.debug("Successful #{request_type} #{method} request retry #{retry_count}")
+          end
+
+          Lita.logger.debug("#{method} #{request_type} request retry #{retry_count}. HTTP Status: #{response.status}. Body: '#{response.body}'. Headers: #{response.headers}.")
+
+          data['__RESPONSE__'] = response
           data
         end
 
@@ -202,6 +286,29 @@ module Lita
 
         def fetch_cursor(page)
           page.dig("response_metadata", "next_cursor")
+        end
+
+        def users_list
+          call_paginated_api(method: 'users.list', params: {limit: DEFAULT_PAGE_SIZE}, result_field: 'members')
+        end
+
+        def log_to_sentry(message, url, post_data)
+          require 'sentry-ruby'
+          Sentry.capture_exception(
+            StandardError.new(message),
+            tags: {
+              build_sha: ENV.fetch("GITLAB_COMMIT_SHA", ""),
+              version: File.read(".semver"),
+              trace_id: "no_trace_id",
+              user: "unknown",
+              lita_cmd: url
+            },
+            extra: {
+              lita_cmd: url,
+              maintainers: "Tools, #dev-tools for support",
+              post_data: post_data
+            }
+          )
         end
       end
     end
