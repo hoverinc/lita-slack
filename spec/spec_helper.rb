@@ -1,12 +1,21 @@
-require "simplecov"
-require "codecov"
-SimpleCov.formatter = SimpleCov::Formatter::Codecov
-SimpleCov.start { add_filter "/spec/" }
+require 'simplecov'
+require 'simplecov-cobertura'
+require 'simplecov-html'
+
+if ENV['COVERAGE']
+  SimpleCov.formatters = SimpleCov::Formatter::MultiFormatter.new([
+    SimpleCov::Formatter::CoberturaFormatter,
+    SimpleCov::Formatter::HTMLFormatter
+  ])
+
+  SimpleCov.start do
+    enable_coverage :branch
+    primary_coverage :branch
+  end
+end
 
 require "shopify-lita-slack"
 require "lita/rspec"
-
-require "pry"
 
 Lita.version_3_compatibility_mode = false
 

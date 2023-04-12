@@ -11,11 +11,11 @@ describe Lita::Adapters::Slack::API do
     config.token = token
   end
 
-  describe "#im_open" do
+  describe "#conversations_open" do
     let(:channel_id) { 'D024BFF1M' }
     let(:stubs) do
       Faraday::Adapter::Test::Stubs.new do |stub|
-        stub.post('https://slack.com/api/im.open', token: token, user: user_id) do
+        stub.post('https://slack.com/api/conversations.open', token: token, users: user_id) do
           [http_status, {}, http_response]
         end
       end
@@ -49,7 +49,7 @@ describe Lita::Adapters::Slack::API do
 
       it "raises a RuntimeError" do
         expect { subject.im_open(user_id) }.to raise_error(
-          "Slack API call to im.open returned an error: invalid_auth."
+          "Slack API call to conversations.open returned an error: invalid_auth."
         )
       end
     end
@@ -60,7 +60,7 @@ describe Lita::Adapters::Slack::API do
 
       it "raises a RuntimeError" do
         expect { subject.im_open(user_id) }.to raise_error(
-          "Slack API call to im.open failed with status code 422: ''. Headers: {}"
+          "Slack API call to conversations.open failed with status code 422: ''. Headers: {}"
         )
       end
     end
@@ -798,7 +798,13 @@ describe Lita::Adapters::Slack::API do
     let(:http_status) { 200 }
     let(:stubs) do
       Faraday::Adapter::Test::Stubs.new do |stub|
-        stub.post('https://slack.com/api/rtm.start', token: token) do
+        stub.post('https://slack.com/api/users.list', token: token) do
+          [http_status, {}, http_response]
+        end
+        stub.post('https://slack.com/api/rtm.connect', token: token) do
+          [http_status, {id: 'user_id', name: 'test_user'}, http_response]
+        end
+        stub.post('https://slack.com/api/conversations.list', token: token, types: 'public_channel') do
           [http_status, {}, http_response]
         end
       end
@@ -807,16 +813,16 @@ describe Lita::Adapters::Slack::API do
     describe "with a successful response" do
       let(:http_response) do
         MultiJson.dump({
-          ok: true,
-          url: 'wss://example.com/',
-          users: [{ id: 'U023BECGF' }],
-          ims: [{ id: 'D024BFF1M' }],
-          self: { id: 'U12345678' },
-          channels: [{ id: 'C1234567890' }],
-          groups: [{ id: 'G0987654321' }],
-        })
+                         ok: true,
+                         url: 'wss://example.com/',
+                         users: [{ id: 'U023BECGF' }],
+                         ims: [{ id: 'D024BFF1M' }],
+                         self: { id: 'U12345678' },
+                         channels: [{ id: 'C1234567890', is_im: true }],
+                         groups: [{ id: 'G0987654321' }],
+                         members: [{ id: 'U023BECGF' }]
+                       })
       end
-
       it "has data on the bot user" do
         response = subject.rtm_start
 
@@ -826,7 +832,7 @@ describe Lita::Adapters::Slack::API do
       it "has an array of IMs" do
         response = subject.rtm_start
 
-        expect(response.ims[0].id).to eq('D024BFF1M')
+        expect(response.ims[0].id).to eq('C1234567890')
       end
 
       it "has an array of users" do

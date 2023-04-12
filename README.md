@@ -13,6 +13,13 @@ Add **lita-slack** to your Lita instance's Gemfile:
 gem "lita-slack"
 ```
 
+## Local Testing
+
+```
+bundle install
+bundle exec rake test:unit
+```
+
 ## Configuration
 
 ### Required attributes
